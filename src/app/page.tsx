@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { CanvasManager } from "@/engine/CanvasManager";
 import ToolPanel from "@/components/ToolPanel";
 import LayerPanel from "@/components/LayerPanel";
+import { StatusPanel } from "@/components/StatusPanel";
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -53,6 +54,7 @@ export default function Home() {
         <>
           <ToolPanel engine={engine} />
           <LayerPanel engine={engine} />
+          <StatusPanel engine={engine} />
         </>
       )}
     </main>

@@ -111,11 +111,13 @@ export class CanvasManager {
                 screenSize: vec2f,
                 cameraPos: vec2f,
                 zoom: f32,
-                padding: f32,
+                flags: f32, // 1.0 = Show Grid
             };
 
             struct TileUniforms {
                 pos: vec2f,
+                scale: f32, 
+                padding: f32,
             };
 
             @group(0) @binding(0) var<uniform> viewport : ViewportUniforms;
@@ -145,7 +147,8 @@ export class CanvasManager {
                 );
 
                 let vPos = pos[VertexIndex];
-                let worldPos = tile.pos + (vPos * ${TILE_SIZE}.0);
+                // Scale the tile quad based on LOD level
+                let worldPos = tile.pos + (vPos * ${TILE_SIZE}.0 * tile.scale);
                 
                 let centered = (worldPos - viewport.cameraPos) * viewport.zoom;
                 
@@ -162,7 +165,26 @@ export class CanvasManager {
 
             @fragment
             fn frag_main(@location(0) uv : vec2f) -> @location(0) vec4f {
-                return textureSample(myTexture, mySampler, uv);
+                let color = textureSample(myTexture, mySampler, uv);
+                
+                // Debug Grid Overlay
+                if (viewport.flags > 0.5) {
+                    let borderWidth = 0.02; // relative to tile (0-1)
+                    if (uv.x < borderWidth || uv.x > (1.0 - borderWidth) || 
+                        uv.y < borderWidth || uv.y > (1.0 - borderWidth)) {
+                        
+                        // Color code by Level
+                        // tile.scale = 2^level, so level = log2(tile.scale)
+                        let level = log2(tile.scale);
+                        
+                        if (level < 0.5) { return vec4f(1.0, 0.0, 0.0, 1.0); } // Red = Level 0
+                        else if (level < 1.5) { return vec4f(0.0, 1.0, 0.0, 1.0); } // Green = Level 1
+                        else if (level < 2.5) { return vec4f(0.0, 0.0, 1.0, 1.0); } // Blue = Level 2
+                        else { return vec4f(1.0, 1.0, 0.0, 1.0); } // Yellow = Level 3+
+                    }
+                }
+                
+                return color;
             }
           `
     });
@@ -179,7 +201,7 @@ export class CanvasManager {
 
     const bindGroupLayout0 = this.device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: {} },
+        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: {} },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} }
       ]
     });
@@ -195,7 +217,7 @@ export class CanvasManager {
     const bindGroupLayout1 = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: {} } // TilePos Uniform
+        { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: {} } // TilePos Uniform
       ]
     });
 
@@ -408,6 +430,7 @@ export class CanvasManager {
       const zoomSensitivity = 0.001;
       const newZoom = this.viewport.zoom * (1 - e.deltaY * zoomSensitivity);
       this.viewport.zoom = Math.max(0.1, Math.min(newZoom, 10.0));
+      this.notifyListeners();
       // Ideally zoom towards pointer, but keeping simple for now
     }, { passive: false });
 
@@ -663,6 +686,13 @@ export class CanvasManager {
     return [...this.layers]; // Returns Bottom-to-Top order (render order)
   }
 
+  public debugGrid: boolean = false;
+
+  public setDebugGrid(enabled: boolean) {
+    this.debugGrid = enabled;
+    // Don't need to notify listeners unless UI needs to know, but UI sets it.
+  }
+
   public subscribe(callback: () => void) {
     this.listeners.add(callback);
     return () => { this.listeners.delete(callback); };
@@ -709,7 +739,7 @@ export class CanvasManager {
     const uniforms = new Float32Array([
       this.viewport.width, this.viewport.height,
       this.viewport.x, this.viewport.y,
-      this.viewport.zoom, 0, 0, 0
+      this.viewport.zoom, this.debugGrid ? 1.0 : 0.0, 0, 0
     ]);
     this.device.queue.writeBuffer(this.uniformBuffer, 0, uniforms);
 
@@ -753,14 +783,16 @@ export class CanvasManager {
       if (!tile.texture) continue;
 
       const tilePosBuffer = this.device.createBuffer({
-        size: 16, // vec2f + padding? No just vec2f is 8 bytes. But Uniform must be 16 bytes aligned for binding? Usually min 16.
+        size: 16, // vec2f + f32 + f32 (padding) = 16 bytes
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         mappedAtCreation: true
       });
 
-      const tileX = tile.tx * TILE_SIZE;
-      const tileY = tile.ty * TILE_SIZE;
-      new Float32Array(tilePosBuffer.getMappedRange()).set([tileX, tileY]);
+      const scale = Math.pow(2, tile.level);
+      const tileX = tile.tx * TILE_SIZE * scale;
+      const tileY = tile.ty * TILE_SIZE * scale;
+
+      new Float32Array(tilePosBuffer.getMappedRange()).set([tileX, tileY, scale, 0]);
       tilePosBuffer.unmap();
 
       const bg1 = this.device.createBindGroup({

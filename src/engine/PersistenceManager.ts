@@ -56,6 +56,20 @@ export class PersistenceManager {
 
     // --- Tile Persistence (IndexedDB) ---
 
+    public async deleteTile(key: string) {
+        if (!this.db) await this.initDB();
+        if (!this.db) return;
+
+        return new Promise<void>((resolve, reject) => {
+            const transaction = this.db!.transaction([this.storeName], "readwrite");
+            const store = transaction.objectStore(this.storeName);
+            const request = store.delete(key);
+
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
     public async saveTile(key: string, blob: Blob) {
         if (!this.db) await this.initDB();
         if (!this.db) return;

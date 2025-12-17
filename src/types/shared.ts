@@ -34,9 +34,9 @@ export interface BrushSettings {
   type: BrushType;
 }
 
-// Key format: "layerId:tx:ty"
+// Key format: "layerId:level:tx:ty"
 export type TileKey = string;
 
-export function getTileKey(layerId: string, tx: number, ty: number): TileKey {
-  return `${layerId}:${tx}:${ty}`;
-}
+export const getTileKey = (layerId: string, tx: number, ty: number, level: number = 0) => {
+  return `${layerId}:${level}:${tx}:${ty}`;
+};

@@ -1,0 +1,39 @@
+.panel {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    background: rgba(30, 30, 30, 0.9);
+    backdrop-filter: blur(10px);
+    padding: 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: white;
+    font-family: 'Inter', sans-serif;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    pointer-events: auto;
+}
+
+.zoom {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    min-width: 60px;
+}
+
+.controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.checkbox {
+    cursor: pointer;
+}
+
+.label {
+    font-size: 0.9em;
+    color: #ccc;
+    cursor: pointer;
+}
