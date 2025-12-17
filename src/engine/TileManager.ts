@@ -20,6 +20,27 @@ export class TileManager {
         this.persistenceManager = new PersistenceManager();
     }
 
+    public getTileByKey(key: string) {
+        return this.tiles.get(key);
+    }
+
+    public getTile(layerId: string, tx: number, ty: number) {
+        return this.tiles.get(getTileKey(layerId, tx, ty, 0)); // Legacy or Level 0 helper
+    }
+
+    public async forceLoadTile(layerId: string, tx: number, ty: number, level: number) {
+        const key = getTileKey(layerId, tx, ty, level);
+        if (!this.tiles.has(key)) {
+            const tile: TileState = { // Explicit type
+                texture: null,
+                status: 'loading',
+                lastUsedTimestamp: performance.now()
+            };
+            this.tiles.set(key, tile);
+            return this.loadTileData(layerId, tx, ty, level);
+        }
+    }
+
     public update(viewport: ViewportState, layers: Layer[]) {
         // 1. Calculate ideal LOD level
         // Level 0: 1:1 (Zoom 1.0)

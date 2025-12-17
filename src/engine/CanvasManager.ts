@@ -39,6 +39,11 @@ export class CanvasManager {
   private brushColor: { r: number, g: number, b: number, a: number } = { r: 0, g: 0, b: 0, a: 1 };
   private brushSize: number = 50;
 
+  private strokePoints: { x: number, y: number, pressure: number }[] = [];
+  private overlayTexture: GPUTexture | null = null;
+  private overlayPipeline: GPURenderPipeline | null = null;
+  private overlayCompositePipeline: GPURenderPipeline | null = null;
+
   private brushPipeline: GPURenderPipeline | null = null;
   private eraserPipeline: GPURenderPipeline | null = null;
   private brushUniformBuffer: GPUBuffer | null = null; // Brush params (color, size, etc.)
@@ -169,18 +174,29 @@ export class CanvasManager {
                 
                 // Debug Grid Overlay
                 if (viewport.flags > 0.5) {
-                    let borderWidth = 0.02; // relative to tile (0-1)
-                    if (uv.x < borderWidth || uv.x > (1.0 - borderWidth) || 
-                        uv.y < borderWidth || uv.y > (1.0 - borderWidth)) {
+                    let w = 0.005; // Thickness
+                    let onLeft = uv.x < w;
+                    let onRight = uv.x > 1.0 - w;
+                    let onTop = uv.y < w;
+                    let onBottom = uv.y > 1.0 - w;
+                    
+                    if (onLeft || onRight || onTop || onBottom) {
+                        let dashX = sin(uv.x * 150.0);
+                        let dashY = sin(uv.y * 150.0);
                         
-                        // Color code by Level
-                        // tile.scale = 2^level, so level = log2(tile.scale)
-                        let level = log2(tile.scale);
+                        var draw = false;
+                        if ((onLeft || onRight) && dashY > 0.0) { draw = true; }
+                        if ((onTop || onBottom) && dashX > 0.0) { draw = true; }
                         
-                        if (level < 0.5) { return vec4f(1.0, 0.0, 0.0, 1.0); } // Red = Level 0
-                        else if (level < 1.5) { return vec4f(0.0, 1.0, 0.0, 1.0); } // Green = Level 1
-                        else if (level < 2.5) { return vec4f(0.0, 0.0, 1.0, 1.0); } // Blue = Level 2
-                        else { return vec4f(1.0, 1.0, 0.0, 1.0); } // Yellow = Level 3+
+                        if (draw) {
+                            // Color code by Level
+                            let level = log2(tile.scale);
+                            
+                            if (level < 0.5) { return vec4f(1.0, 0.0, 0.0, 1.0); } // Red = Level 0
+                            else if (level < 1.5) { return vec4f(0.0, 1.0, 0.0, 1.0); } // Green = Level 1
+                            else if (level < 2.5) { return vec4f(0.0, 0.0, 1.0, 1.0); } // Blue = Level 2
+                            else { return vec4f(1.0, 1.0, 0.0, 1.0); } // Yellow = Level 3+
+                        }
                     }
                 }
                 
@@ -255,9 +271,10 @@ export class CanvasManager {
       code: `
              struct BrushUniforms {
                  color: vec4f,
-                 pos: vec2f, // Center of brush in LOCAL Tile coordinates (0-256)
-                 size: f32,  // Radius
-                 padding: f32, // align
+                 pos: vec2f, 
+                 targetSize: vec2f,
+                 size: f32,  
+                 padding: vec3f,
              };
              
              @group(0) @binding(0) var<uniform> brush : BrushUniforms;
@@ -293,16 +310,15 @@ export class CanvasManager {
                 // x: -1 -> 0, 1 -> 256
                 // x_pixel = (p.x + 1) * 0.5 * 256
                 
-                let x_pix = (p.x + 1.0) * 0.5 * ${TILE_SIZE}.0;
+                let x_pix = (p.x + 1.0) * 0.5 * brush.targetSize.x;
                 // y: -1 is bottom? WebGPU clip Y is up? 
                 // In render pass to texture, usually standard Y up? 
                 // Let's assume (0,0) is top-left for TILE pixel coord logic.
-                // Clip (-1, 1) -> Top Left (0,0) ??
-                // WebGPU Clip: (-1, -1) = Bottom Left, (1, 1) = Top Right.
+                // Clip (-1, -1) = Bottom Left, (1, 1) = Top Right.
                 // Texture Coord: (0, 0) = Top Left usually.
                 // So Y needs flip.
                 
-                let y_pix = (1.0 - p.y) * 0.5 * ${TILE_SIZE}.0; // Flip Y
+                let y_pix = (1.0 - p.y) * 0.5 * brush.targetSize.y; // Flip Y
                 
                 output.localPos = vec2f(x_pix, y_pix);
                 
@@ -323,7 +339,7 @@ export class CanvasManager {
     });
 
     this.brushUniformBuffer = this.device.createBuffer({
-      size: 32, // vec4 + vec2 + f32 + pad = 16 + 8 + 4 + 4 = 32
+      size: 64, // Aligned to 64 bytes
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
@@ -376,6 +392,65 @@ export class CanvasManager {
           blend: {
             color: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha', operation: 'add' },
             alpha: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+          }
+        }]
+      },
+      primitive: { topology: 'triangle-list' }
+    });
+  }
+
+  private initOverlayCompositePipeline() {
+    if (this.overlayCompositePipeline) return;
+    const shaderModule = this.device!.createShaderModule({
+      code: `
+            struct VertexOutput {
+                @builtin(position) Position : vec4f,
+                @location(0) uv : vec2f,
+            };
+            
+            @vertex
+            fn vert_main(@builtin(vertex_index) VertexIndex : u32) -> VertexOutput {
+                var output : VertexOutput;
+                var pos = array<vec2f, 6>(
+                    vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+                    vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0)
+                );
+                let p = pos[VertexIndex];
+                output.Position = vec4f(p, 0.0, 1.0);
+                output.uv = vec2f((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5); 
+                return output;
+            }
+            
+            @group(0) @binding(0) var myTexture : texture_2d<f32>;
+            @group(0) @binding(1) var mySampler : sampler;
+            
+            @fragment
+            fn frag_main(@location(0) uv : vec2f) -> @location(0) vec4f {
+                return textureSample(myTexture, mySampler, uv);
+            }
+          `
+    });
+
+    const bindGroupLayout = this.device!.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} }
+      ]
+    });
+
+    const layout = this.device!.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+    this.overlayCompositePipeline = this.device!.createRenderPipeline({
+      layout,
+      vertex: { module: shaderModule, entryPoint: 'vert_main' },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'frag_main',
+        targets: [{
+          format: navigator.gpu.getPreferredCanvasFormat(),
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }
           }
         }]
       },
@@ -443,7 +518,11 @@ export class CanvasManager {
         this.canvas.style.cursor = 'grabbing';
       } else if (e.buttons === 1) {
         // Start Drawing
-        this.drawStroke(e.clientX, e.clientY, e.pressure);
+        this.isPanning = false;
+        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+        this.strokePoints = []; // Reset Stroke Buffer
+        // Do we draw the first point?
+        // pointermove will handle it.
       }
     });
 
@@ -451,26 +530,27 @@ export class CanvasManager {
       if (this.isPanning) {
         const dx = e.clientX - this.lastPointerPos.x;
         const dy = e.clientY - this.lastPointerPos.y;
-
-        // Move viewport opposite to drag
         this.viewport.x -= dx / this.viewport.zoom;
         this.viewport.y -= dy / this.viewport.zoom;
-
         this.lastPointerPos = { x: e.clientX, y: e.clientY };
-      } else if (e.buttons === 1 && !this.isSpacePressed) {
-        this.drawStroke(e.clientX, e.clientY, e.pressure);
+        this.notifyListeners();
+      } else if (e.buttons === 1 && this.activeTool) {
+        // Drawing
+        // Interpolate
+        this.interpolateStroke(this.lastPointerPos.x, this.lastPointerPos.y, e.clientX, e.clientY, e.pressure);
+        this.lastPointerPos = { x: e.clientX, y: e.clientY };
       }
     });
 
     this.canvas.addEventListener('pointerup', (e) => {
+      this.canvas.releasePointerCapture(e.pointerId);
       if (this.isPanning) {
         this.isPanning = false;
         this.canvas.style.cursor = this.isSpacePressed ? 'grab' : 'default';
       } else {
-        // End of stroke -> Save Persistance
-        this.saveDirtyTiles();
+        // Commit the buffered stroke to tiles (LOD 0)
+        this.commitStroke().catch(console.error);
       }
-      this.canvas.releasePointerCapture(e.pointerId);
     });
   }
 
@@ -487,95 +567,75 @@ export class CanvasManager {
     this.dirtyTiles.clear();
   }
 
-  // override drawStroke to track dirty
   private drawStroke(screenX: number, screenY: number, pressure: number) {
     if (!this.tileManager || !this.device || !this.brushPipeline || !this.eraserPipeline || !this.brushBindGroup || !this.brushUniformBuffer) return;
 
     const world = this.screenToWorld(screenX, screenY);
+    this.strokePoints.push({ x: world.x, y: world.y, pressure });
 
-    const brushSize = this.brushSize * pressure;
-    // For Eraser: Color doesn't matter for RGB if srcFactor is zero, but Alpha matters for DstFactor (OneMinusSrcAlpha).
-    // If we want full erase, Alpha = 1.0.
-    const brushColor = this.brushColor;
+    // Draw to Overlay for feedback
+    if (this.overlayTexture) {
+      // Prevent Eraser from drawing on overlay to be confusing? 
+      // For now, let's draw eraser as White or just standard blend?
+      // If alpha blend: Eraser (alpha 1) -> Destination Alpha?
+      // Simpler: Just render brush strokes. If eraser, maybe skip overlay feedback or render Red?
+      // Let's render everything using brush pipeline logic but different blending?
 
-    // Determine affected area in World Space
-    const minX = world.x - brushSize;
-    const maxX = world.x + brushSize;
-    const minY = world.y - brushSize;
-    const maxY = world.y + brushSize;
+      const isEraser = this.activeTool === 'eraser';
+      // Just use Brush Pipeline for overlay feedback always? 
+      // If eraser, we maybe want to see where we are erasing.
+      // Let's use BrushPipeline always for Overlay but with a faint color if eraser?
+      const activePipeline = isEraser ? this.brushPipeline : (this.activeTool === 'eraser' ? this.eraserPipeline : this.brushPipeline);
+      // Actually current pipeline handles blending.
+      // If we use EraserPipeline on Overlay, it subtracts alpha. Overlay is empty (alpha 0). So it does nothing invisible.
+      // So for Eraser, we should probably render a visual indicator (like a white/pink stroke).
+      const renderColor = isEraser ? { r: 1, g: 0.8, b: 0.8, a: 0.5 } : this.brushColor;
+      const renderPipeline = this.brushPipeline; // Always use additive/alpha brush for visual feedback
 
-    // Determine range of tiles
-    const minTx = Math.floor(minX / TILE_SIZE);
-    const maxTx = Math.floor(maxX / TILE_SIZE);
-    const minTy = Math.floor(minY / TILE_SIZE);
-    const maxTy = Math.floor(maxY / TILE_SIZE);
+      const brushSize = this.brushSize * pressure * this.viewport.zoom; // Scale visual brush to match zoom? 
+      // Actually screen size of brush should be constant?
+      // No, `brushSize` is World Units.
+      // Screen Space Size = WorldSize * Zoom.
+      // The Shader expects `size` in same units as `pos`.
+      // `pos` is Screen Pixels.
+      // So `size` must be Screen Pixels.
+      const screenBrushSize = (this.brushSize * pressure) * this.viewport.zoom;
 
-    const commandEncoder = this.device.createCommandEncoder();
-    let hasWork = false;
+      const uniforms = new Float32Array([
+        renderColor.r, renderColor.g, renderColor.b, renderColor.a,
+        screenX, screenY,
+        this.viewport.width, this.viewport.height,
+        screenBrushSize, 0, 0, 0,
+        0, 0, 0, 0
+      ]);
 
-    const activePipeline = this.activeTool === 'eraser' ? this.eraserPipeline : this.brushPipeline;
+      const uniformBuffer = this.device.createBuffer({
+        size: 64,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true
+      });
+      new Float32Array(uniformBuffer.getMappedRange()).set(uniforms);
+      uniformBuffer.unmap();
 
-    for (let tx = minTx; tx <= maxTx; tx++) {
-      for (let ty = minTy; ty <= maxTy; ty++) {
-        const texture = this.tileManager.getTile(this.activeLayerId, tx, ty);
-        if (!texture) continue;
+      const bg = this.device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+      });
 
-        // TRACK DIRTY
-        const key = `${this.activeLayerId}:${tx}:${ty}`;
-        this.dirtyTiles.add(key);
-        // ... rest of draw logic
-        const localX = world.x - (tx * TILE_SIZE);
-        const localY = world.y - (ty * TILE_SIZE);
+      const commandEncoder = this.device.createCommandEncoder();
+      const renderPass = commandEncoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.overlayTexture.createView(),
+          loadOp: 'load',
+          storeOp: 'store'
+        }]
+      });
 
-        // Check if within bounds (optimization)? 
-        // Shader discards anyway, but good to know.
+      renderPass.setPipeline(renderPipeline);
+      renderPass.setBindGroup(0, bg);
+      renderPass.draw(6);
+      renderPass.end();
 
-        // We need a specific Uniform Buffer for EACH draw call because we change localX/localY?
-        // OR: We change the implementation to pass localPos in Push Constants (not avail in WebGPU)
-        // OR: Use dynamic offsets.
-        // OR: Just writeBuffer before each pass? 
-        // LIMITATION: writeBuffer puts commands in Queue. RenderPass is encoded synchronously.
-        // You cannot interleave queue.writeBuffer inside a CommandEncoder recording easily without multiple submits for same resource.
-        // FIX: Create a temporary buffer for each draw call (mappedAtCreation or createBuffer+writeBuffer).
-        // Since this is 1-4 tiles max, creating 4 small buffers is fine.
-
-        const uniforms = new Float32Array([
-          brushColor.r, brushColor.g, brushColor.b, brushColor.a,
-          localX, localY,
-          brushSize, 0
-        ]);
-
-        const uniformBuffer = this.device.createBuffer({
-          size: 32,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-          mappedAtCreation: true
-        });
-        new Float32Array(uniformBuffer.getMappedRange()).set(uniforms);
-        uniformBuffer.unmap();
-
-        // We need a BindGroup for THIS buffer
-        const bg = this.device.createBindGroup({
-          layout: activePipeline.getBindGroupLayout(0),
-          entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
-        });
-
-        const renderPass = commandEncoder.beginRenderPass({
-          colorAttachments: [{
-            view: texture.createView(),
-            loadOp: 'load',
-            storeOp: 'store'
-          }]
-        });
-
-        renderPass.setPipeline(activePipeline);
-        renderPass.setBindGroup(0, bg);
-        renderPass.draw(6);
-        renderPass.end();
-        hasWork = true;
-      }
-    }
-
-    if (hasWork) {
       this.device.queue.submit([commandEncoder.finish()]);
     }
   }
@@ -647,6 +707,129 @@ export class CanvasManager {
 
   public getActiveLayer() {
     return this.activeLayerId;
+  }
+
+  private async commitStroke() {
+    if (this.strokePoints.length === 0) return;
+
+    // 1. Calculate AABB of stroke
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let maxPressure = 0;
+    for (const p of this.strokePoints) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+      if (p.pressure > maxPressure) maxPressure = p.pressure;
+    }
+
+    // Expand by max brush size
+    const margin = this.brushSize * 1.0; // max possible size roughly
+    minX -= margin; minY -= margin; maxX += margin; maxY += margin;
+
+    // 2. Identify Tiles
+    const minTx = Math.floor(minX / TILE_SIZE);
+    const maxTx = Math.floor(maxX / TILE_SIZE);
+    const minTy = Math.floor(minY / TILE_SIZE);
+    const maxTy = Math.floor(maxY / TILE_SIZE);
+
+    const activePipeline = this.activeTool === 'eraser' ? this.eraserPipeline : this.brushPipeline;
+    const brushColor = this.brushColor;
+
+    // 3. Process Tiles
+    for (let tx = minTx; tx <= maxTx; tx++) {
+      for (let ty = minTy; ty <= maxTy; ty++) {
+        // Ensure tile is loaded (Level 0)
+        const key = `${this.activeLayerId}:0:${tx}:${ty}`; // Level 0 key
+
+        // Check memory
+        let tile = this.tileManager.getTileByKey(key);
+
+        if (!tile) {
+          // Force Load
+          await this.tileManager.forceLoadTile(this.activeLayerId, tx, ty, 0); // Need to expose this or use existing
+          tile = this.tileManager.getTileByKey(key);
+        }
+
+        if (tile && tile.texture && tile.status === 'ready') {
+          const commandEncoder = this.device!.createCommandEncoder();
+          const renderPass = commandEncoder.beginRenderPass({
+            colorAttachments: [{
+              view: tile.texture.createView(),
+              loadOp: 'load',
+              storeOp: 'store'
+            }]
+          });
+
+          renderPass.setPipeline(activePipeline!);
+
+          // Draw all points
+          for (const p of this.strokePoints) {
+            const localX = p.x - (tx * TILE_SIZE);
+            const localY = p.y - (ty * TILE_SIZE);
+            const size = this.brushSize * p.pressure;
+
+            // Frustum cull point against tile? Optimization.
+            if (localX < -size || localX > TILE_SIZE + size || localY < -size || localY > TILE_SIZE + size) continue;
+
+            const uniforms = new Float32Array([
+              brushColor.r, brushColor.g, brushColor.b, brushColor.a,
+              localX, localY,
+              TILE_SIZE, TILE_SIZE,
+              size, 0, 0, 0,
+              0, 0, 0, 0
+            ]);
+
+            // Dynamic buffer creation (slow but safe)
+            // Optimization: Reuse one big buffer with dynamic offsets? 
+            // MVP: Create buffer
+            const uBuffer = this.device!.createBuffer({
+              size: 64,
+              usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+              mappedAtCreation: true
+            });
+            new Float32Array(uBuffer.getMappedRange()).set(uniforms);
+            uBuffer.unmap();
+
+            const bg = this.device!.createBindGroup({
+              layout: activePipeline!.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: uBuffer } }]
+            });
+
+            renderPass.setBindGroup(0, bg);
+            renderPass.draw(6);
+          }
+
+          renderPass.end();
+          this.device!.queue.submit([commandEncoder.finish()]);
+
+          // Save and Invalidate
+          // We should await this? Or fire/forget?
+          // await this.tileManager.saveTile(...) might be slow.
+          // Fire and forget is better for UI responsiveness, but might race.
+          // Let's await to be safe.
+          await this.tileManager.saveTile(this.activeLayerId, tx, ty, 0);
+        }
+      }
+    }
+
+    // 4. Cleanup
+    this.strokePoints = [];
+
+    // Clear Overlay
+    if (this.overlayTexture) {
+      const encoder = this.device!.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.overlayTexture.createView(),
+          loadOp: 'clear',
+          storeOp: 'store',
+          clearValue: { r: 0, g: 0, b: 0, a: 0 }
+        }]
+      });
+      pass.end();
+      this.device!.queue.submit([encoder.finish()]);
+    }
   }
 
   public addLayer(name: string = "New Layer") {
@@ -721,6 +904,13 @@ export class CanvasManager {
 
     this.viewport.width = width;
     this.viewport.height = height;
+
+    if (this.overlayTexture) this.overlayTexture.destroy();
+    this.overlayTexture = this.device.createTexture({
+      size: [width, height],
+      format: navigator.gpu.getPreferredCanvasFormat(),
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    });
   }
 
   private startRenderLoop() {
@@ -804,6 +994,23 @@ export class CanvasManager {
       });
 
       passEncoder.setBindGroup(1, bg1);
+      passEncoder.draw(6);
+    }
+
+    // Draw Overlay
+    if (this.overlayTexture) {
+      if (!this.overlayCompositePipeline) this.initOverlayCompositePipeline();
+
+      const bg = this.device.createBindGroup({
+        layout: this.overlayCompositePipeline!.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.overlayTexture.createView() },
+          { binding: 1, resource: this.sampler }
+        ]
+      });
+
+      passEncoder.setPipeline(this.overlayCompositePipeline!);
+      passEncoder.setBindGroup(0, bg);
       passEncoder.draw(6);
     }
 
