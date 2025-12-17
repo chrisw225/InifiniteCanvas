@@ -1,0 +1,135 @@
+.panel {
+    position: absolute;
+    top: 80px;
+    /* Below Tool Panel or flexible */
+    right: 20px;
+    background: #2b2b2b;
+    color: #d4d4d4;
+    backdrop-filter: blur(10px);
+    border-radius: 8px;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+    width: 240px;
+    font-family: 'Segoe UI', sans-serif;
+    border: 1px solid #444;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    max-height: 50vh;
+}
+
+.title {
+    padding: 10px 12px;
+    background: #333;
+    margin: 0;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #aaa;
+    border-bottom: 1px solid #444;
+    font-weight: 600;
+}
+
+.list {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.layerItem {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid #333;
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.9rem;
+    transition: background 0.1s;
+}
+
+.layerItem:hover {
+    background: #3a3a3a;
+}
+
+.active {
+    background: #4a4a4a;
+}
+
+.active:hover {
+    background: #505050;
+}
+
+.selected {
+    background: #364e63;
+    /* Subtle blue */
+}
+
+.selected:hover {
+    background: #405a70;
+}
+
+/* If item is BOTH active and selected, prefer active color or mix? 
+   Usually Active is the "Primary Selection". 
+   Let's say Active overrides or combines. */
+.active.selected {
+    background: #364e63;
+    border-left: 3px solid #0099ff;
+    padding-left: 9px;
+    /* Compensate border */
+}
+
+/* Visibility Eye */
+.eyeWrapper {
+    width: 24px;
+    display: flex;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.7;
+}
+
+.eyeWrapper:hover {
+    opacity: 1;
+}
+
+.eyeHidden {
+    opacity: 0.2;
+}
+
+.layerName {
+    flex: 1;
+    margin-left: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Footer Controls */
+.footer {
+    display: flex;
+    padding: 8px;
+    border-top: 1px solid #444;
+    background: #333;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.iconBtn {
+    background: transparent;
+    border: none;
+    color: #ccc;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+    font-size: 1rem;
+}
+
+.iconBtn:hover {
+    background: #444;
+    color: white;
+}
+
+.iconBtn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}

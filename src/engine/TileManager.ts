@@ -1,4 +1,5 @@
 import { ViewportState, TILE_SIZE, TileCoord, getTileKey, Layer } from "@/types/shared";
+import { PersistenceManager } from "./PersistenceManager";
 
 interface TileState {
     texture: GPUTexture | null;
@@ -12,9 +13,11 @@ export class TileManager {
     private tiles: Map<string, TileState> = new Map();
     // Buffer factor: 2 means load tiles within 2x viewport size
     private readonly BUFFER_FACTOR = 1.0;
+    private persistenceManager: PersistenceManager;
 
     constructor(device: GPUDevice) {
         this.device = device;
+        this.persistenceManager = new PersistenceManager();
     }
 
     public update(viewport: ViewportState, layers: Layer[]) {
@@ -46,15 +49,19 @@ export class TileManager {
 
         // 2. Identify tiles to load
         for (const layer of layers) {
-            if (!layer.visible) continue;
+            // Note: We keep hidden tiles in memory (via timestamp update) to avoid data loss on hide.
+            // But we only CREATE new tiles if visible (or if we decide to pre-load hidden ones, but simpler to wait).
 
             for (let tx = loadMinTx; tx <= loadMaxTx; tx++) {
                 for (let ty = loadMinTy; ty <= loadMaxTy; ty++) {
                     const key = getTileKey(layer.id, tx, ty);
                     let tile = this.tiles.get(key);
 
-                    if (!tile) {
-                        // New tile, start loading
+                    if (tile) {
+                        // Tile exists: Keep it alive via timestamp update
+                        tile.lastUsedTimestamp = now;
+                    } else if (layer.visible) {
+                        // Tile missing AND layer visible: Load (Create) it
                         tile = {
                             texture: null,
                             status: 'loading',
@@ -62,8 +69,6 @@ export class TileManager {
                         };
                         this.tiles.set(key, tile);
                         this.loadTileData(layer.id, tx, ty);
-                    } else {
-                        tile.lastUsedTimestamp = now;
                     }
                 }
             }
@@ -77,29 +82,34 @@ export class TileManager {
         const key = getTileKey(layerId, tx, ty);
 
         try {
-            // Mock fetch - in real app, fetch from API
-            // const response = await fetch(`/api/tile/${layerId}/${tx}/${ty}`);
-            // For now, create a blank texture
-
-            // Simulate network delay
-            // await new Promise(resolve => setTimeout(resolve, 100));
+            // 1. Try Persistence
+            const blob = await this.persistenceManager.loadTile(key);
 
             // Create GPU Texture
             const texture = this.device.createTexture({
                 size: [TILE_SIZE, TILE_SIZE],
-                format: navigator.gpu.getPreferredCanvasFormat(), // Match swap chain for simplicity in MVP
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+                format: navigator.gpu.getPreferredCanvasFormat(),
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
             });
 
-            // Clear to transparent (or debug color)
-            // We will leave it empty for now, relying on render pass loadOp 'clear' if we were rendering TO it. 
-            // But since we are rendering IT, we need content.
-            // Let's create a checkerboard pattern for debug if it's the background layer.
+            if (blob) {
+                // 2. Load from Persistence
+                const arrayBuffer = await blob.arrayBuffer();
+                const data = new Uint8Array(arrayBuffer);
 
-            if (layerId === 'layer-0') {
-                this.writeDebugPattern(texture, tx, ty);
+                this.device.queue.writeTexture(
+                    { texture: texture },
+                    data,
+                    { bytesPerRow: TILE_SIZE * 4 },
+                    { width: TILE_SIZE, height: TILE_SIZE }
+                );
             } else {
-                this.clearTexture(texture);
+                // 3. New Tile (Init logic)
+                if (layerId === 'layer-0') {
+                    this.writeDebugPattern(texture, tx, ty);
+                } else {
+                    this.clearTexture(texture);
+                }
             }
 
             const tile = this.tiles.get(key);
@@ -114,6 +124,52 @@ export class TileManager {
             if (tile) tile.status = 'error';
         }
     }
+
+    public async saveTile(layerId: string, tx: number, ty: number) {
+        const key = getTileKey(layerId, tx, ty);
+        const tile = this.tiles.get(key);
+        if (!tile || !tile.texture || tile.status !== 'ready') return;
+
+        // Read texture back to CPU
+        const pixelSize = 4; // RGBA8
+        const bufferSize = TILE_SIZE * TILE_SIZE * pixelSize;
+
+        // 1. Copy Texture to Buffer
+        const buffer = this.device.createBuffer({
+            size: bufferSize,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
+
+        const commandEncoder = this.device.createCommandEncoder();
+        commandEncoder.copyTextureToBuffer(
+            { texture: tile.texture },
+            { buffer: buffer, bytesPerRow: TILE_SIZE * pixelSize },
+            { width: TILE_SIZE, height: TILE_SIZE }
+        );
+        this.device.queue.submit([commandEncoder.finish()]);
+
+        // 2. Map Buffer
+        await buffer.mapAsync(GPUMapMode.READ);
+        const arrayBuffer = buffer.getMappedRange().slice(0); // Copy
+        buffer.unmap();
+
+        // 3. Create Blob (Simple Raw Data or PNG?)
+        // IndexedDB handles Blobs well. But raw RGBA data isn't an image format browsers display natively.
+        // Ideally we save as PNG for easier debugging/portability, but raw binary is faster.
+        // Let's stick to raw binary for speed, OR convert to PNG via Canvas (slower).
+        // Plan: Save ArrayBuffer directly. On load, we use copyTextureToBuffer? No copyExternalImageToTexture takes ImageBitmap.
+        // If we supply ArrayBuffer, we must use device.queue.writeTexture.
+
+        // Let's verify load logic: I used `copyExternalImageToTexture` inside `loadTileData`, which expects ImageBitmap.
+        // If I save raw ArrayBuffer, I should use `this.device.queue.writeTexture` instead. 
+        // Let's refactor `loadTileData` to inspect the blob type or just try both.
+        // Actually, easiest MVP: Save as ArrayBuffer, Load using writeTexture.
+
+        const blob = new Blob([arrayBuffer]); // application/octet-stream
+        await this.persistenceManager.saveTile(key, blob);
+    }
+
+    // ... (Private helpers below) ...
 
     private writeDebugPattern(texture: GPUTexture, tx: number, ty: number) {
         // Create a generic buffer to upload 
@@ -184,18 +240,24 @@ export class TileManager {
         }
     }
 
-    public getVisibleTiles(): { key: string, texture: GPUTexture, tx: number, ty: number, layerId: string }[] {
+    public getVisibleTiles(layers: Layer[]): { key: string, texture: GPUTexture, tx: number, ty: number, layerId: string }[] {
+        const visibleLayerIds = new Set(layers.filter(l => l.visible).map(l => l.id));
         const result = [];
+
         for (const [key, tile] of this.tiles.entries()) {
             if (tile.status === 'ready' && tile.texture) {
                 const parts = key.split(':');
-                result.push({
-                    key,
-                    texture: tile.texture,
-                    layerId: parts[0],
-                    tx: parseInt(parts[1]),
-                    ty: parseInt(parts[2])
-                });
+                const layerId = parts[0];
+
+                if (visibleLayerIds.has(layerId)) {
+                    result.push({
+                        key,
+                        texture: tile.texture,
+                        layerId: layerId,
+                        tx: parseInt(parts[1]),
+                        ty: parseInt(parts[2])
+                    });
+                }
             }
         }
         return result;
@@ -212,7 +274,13 @@ export class TileManager {
         // We'll trigger load if missing, but return null for this frame.
         if (!tile) {
             // this.loadTileData(layerId, tx, ty); // Optional: trigger load
+            // But we can't await it here.
         }
         return null;
+    }
+
+    // Helper to get PersistenceManager
+    public getPersistence(): PersistenceManager {
+        return this.persistenceManager;
     }
 }

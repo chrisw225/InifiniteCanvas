@@ -2,10 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CanvasManager } from "@/engine/CanvasManager";
+import ToolPanel from "@/components/ToolPanel";
+import LayerPanel from "@/components/LayerPanel";
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const engineRef = useRef<CanvasManager | null>(null);
+  const [engine, setEngine] = useState<CanvasManager | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -13,9 +15,9 @@ export default function Home() {
 
     const initEngine = async () => {
       try {
-        const engine = new CanvasManager(canvasRef.current!);
-        await engine.initialize();
-        engineRef.current = engine;
+        const instance = new CanvasManager(canvasRef.current!);
+        await instance.initialize();
+        setEngine(instance);
       } catch (err) {
         console.error("Failed to initialize engine:", err);
         setError((err as Error).message);
@@ -25,12 +27,11 @@ export default function Home() {
     initEngine();
 
     return () => {
-      if (engineRef.current) {
-        engineRef.current.destroy();
-        engineRef.current = null;
+      if (engine) {
+        engine.destroy();
       }
     };
-  }, []);
+  }, []); // Run once
 
   if (error) {
     return (
@@ -48,6 +49,12 @@ export default function Home() {
         ref={canvasRef}
         style={{ width: "100%", height: "100%", touchAction: "none" }}
       />
+      {engine && (
+        <>
+          <ToolPanel engine={engine} />
+          <LayerPanel engine={engine} />
+        </>
+      )}
     </main>
   );
 }

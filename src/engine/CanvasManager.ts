@@ -31,16 +31,22 @@ export class CanvasManager {
   // Input State
   private isSpacePressed = false;
   private isPanning = false;
-  private lastPointerX = 0;
-  private lastPointerY = 0;
+  private lastPointerPos = { x: 0, y: 0 };
 
 
   // Brush Pipeline
   private activeTool: 'brush' | 'eraser' = 'brush';
+  private brushColor: { r: number, g: number, b: number, a: number } = { r: 0, g: 0, b: 0, a: 1 };
+  private brushSize: number = 50;
+
   private brushPipeline: GPURenderPipeline | null = null;
   private eraserPipeline: GPURenderPipeline | null = null;
   private brushUniformBuffer: GPUBuffer | null = null; // Brush params (color, size, etc.)
   private brushBindGroup: GPUBindGroup | null = null;
+
+  // UI State Listeners
+  private listeners: Set<() => void> = new Set();
+
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -71,6 +77,16 @@ export class CanvasManager {
     });
 
     this.tileManager = new TileManager(this.device);
+
+    // Load persisted layers
+    const savedLayers = this.tileManager.getPersistence().loadLayers();
+    if (savedLayers) {
+      this.layers = savedLayers;
+      // Ensure active layer exists
+      if (!this.layers.find(l => l.id === this.activeLayerId)) {
+        this.activeLayerId = this.layers[0]?.id || 'layer-0';
+      }
+    }
 
     await this.initPipeline(format);
     await this.initBrushPipeline(format);
@@ -362,15 +378,102 @@ export class CanvasManager {
     };
   }
 
+  private initInputHandlers() {
+    window.addEventListener('keydown', (e) => {
+      // Tool Shortcuts
+      if (e.key.toLowerCase() === 'b') {
+        this.activeTool = 'brush';
+        this.notifyListeners();
+      }
+      if (e.key.toLowerCase() === 'e') {
+        this.activeTool = 'eraser';
+        this.notifyListeners();
+      }
+
+      if (e.code === 'Space') {
+        this.isSpacePressed = true;
+        this.canvas.style.cursor = 'grab';
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space') {
+        this.isSpacePressed = false;
+        if (!this.isPanning) this.canvas.style.cursor = 'default';
+      }
+    });
+
+    this.canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const zoomSensitivity = 0.001;
+      const newZoom = this.viewport.zoom * (1 - e.deltaY * zoomSensitivity);
+      this.viewport.zoom = Math.max(0.1, Math.min(newZoom, 10.0));
+      // Ideally zoom towards pointer, but keeping simple for now
+    }, { passive: false });
+
+    this.canvas.addEventListener('pointerdown', (e) => {
+      this.canvas.setPointerCapture(e.pointerId);
+
+      if (this.isSpacePressed || e.button === 1 || e.button === 2) {
+        this.isPanning = true;
+        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+        this.canvas.style.cursor = 'grabbing';
+      } else if (e.buttons === 1) {
+        // Start Drawing
+        this.drawStroke(e.clientX, e.clientY, e.pressure);
+      }
+    });
+
+    this.canvas.addEventListener('pointermove', (e) => {
+      if (this.isPanning) {
+        const dx = e.clientX - this.lastPointerPos.x;
+        const dy = e.clientY - this.lastPointerPos.y;
+
+        // Move viewport opposite to drag
+        this.viewport.x -= dx / this.viewport.zoom;
+        this.viewport.y -= dy / this.viewport.zoom;
+
+        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+      } else if (e.buttons === 1 && !this.isSpacePressed) {
+        this.drawStroke(e.clientX, e.clientY, e.pressure);
+      }
+    });
+
+    this.canvas.addEventListener('pointerup', (e) => {
+      if (this.isPanning) {
+        this.isPanning = false;
+        this.canvas.style.cursor = this.isSpacePressed ? 'grab' : 'default';
+      } else {
+        // End of stroke -> Save Persistance
+        this.saveDirtyTiles();
+      }
+      this.canvas.releasePointerCapture(e.pointerId);
+    });
+  }
+
+
+  // Dirty tracking for save optimization
+  private dirtyTiles: Set<string> = new Set();
+
+  private saveDirtyTiles() {
+    if (!this.tileManager) return;
+    this.dirtyTiles.forEach(key => {
+      const [layerId, tx, ty] = key.split(':');
+      this.tileManager!.saveTile(layerId, parseInt(tx), parseInt(ty));
+    });
+    this.dirtyTiles.clear();
+  }
+
+  // override drawStroke to track dirty
   private drawStroke(screenX: number, screenY: number, pressure: number) {
     if (!this.tileManager || !this.device || !this.brushPipeline || !this.eraserPipeline || !this.brushBindGroup || !this.brushUniformBuffer) return;
 
     const world = this.screenToWorld(screenX, screenY);
 
-    const brushSize = 50 * pressure;
+    const brushSize = this.brushSize * pressure;
     // For Eraser: Color doesn't matter for RGB if srcFactor is zero, but Alpha matters for DstFactor (OneMinusSrcAlpha).
     // If we want full erase, Alpha = 1.0.
-    const brushColor = { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    const brushColor = this.brushColor;
 
     // Determine affected area in World Space
     const minX = world.x - brushSize;
@@ -391,10 +494,13 @@ export class CanvasManager {
 
     for (let tx = minTx; tx <= maxTx; tx++) {
       for (let ty = minTy; ty <= maxTy; ty++) {
-        const texture = this.tileManager.getTile('layer-1', tx, ty);
+        const texture = this.tileManager.getTile(this.activeLayerId, tx, ty);
         if (!texture) continue;
 
-        // Calculate local pos on this tile
+        // TRACK DIRTY
+        const key = `${this.activeLayerId}:${tx}:${ty}`;
+        this.dirtyTiles.add(key);
+        // ... rest of draw logic
         const localX = world.x - (tx * TILE_SIZE);
         const localY = world.y - (ty * TILE_SIZE);
 
@@ -467,84 +573,103 @@ export class CanvasManager {
     this.drawStroke(x2, y2, pressure);
   }
 
-  private initInputHandlers() {
-    window.addEventListener('keydown', (e) => {
-      // Tool Shortcuts
-      if (e.key.toLowerCase() === 'b') {
-        this.activeTool = 'brush';
-        console.log("Tool: Brush");
-      }
-      if (e.key.toLowerCase() === 'e') {
-        this.activeTool = 'eraser';
-        console.log("Tool: Eraser");
-      }
+  private activeLayerId: string = 'layer-1';
 
-      if (e.code === 'Space' && !e.repeat) {
-        this.isSpacePressed = true;
-        this.canvas.style.cursor = 'grab';
-      }
+  // --- Public API for UI ---
+
+  public setTool(tool: 'brush' | 'eraser') {
+    this.activeTool = tool;
+    this.notifyListeners();
+  }
+
+  public getTool() {
+    return this.activeTool;
+  }
+
+  public setBrushColor(r: number, g: number, b: number) {
+    this.brushColor = { r, g, b, a: 1.0 };
+    this.notifyListeners();
+  }
+
+  public getBrushColor() {
+    return this.brushColor;
+  }
+
+  public setBrushSize(size: number) {
+    this.brushSize = size;
+    this.notifyListeners();
+  }
+
+  public getBrushSize() {
+    return this.brushSize;
+  }
+
+  public toggleLayer(layerId: string) {
+    const layer = this.layers.find(l => l.id === layerId);
+    if (layer) {
+      layer.visible = !layer.visible;
+      this.notifyListeners();
+      this.tileManager?.getPersistence().saveLayers(this.layers);
+    }
+  }
+
+  public setActiveLayer(layerId: string) {
+    const layer = this.layers.find(l => l.id === layerId);
+    if (layer) {
+      this.activeLayerId = layerId;
+      this.notifyListeners();
+      // No need to save active layer selection unless we persist that too? Not crucial.
+    }
+  }
+
+  public getActiveLayer() {
+    return this.activeLayerId;
+  }
+
+  public addLayer(name: string = "New Layer") {
+    const id = `layer-${Date.now()}`;
+    // Add to top (index 0 is bottom, usually render order is 0->N, so N is top)
+    // Actually typically layers list is Top-to-Bottom in UI, but Bottom-to-Top in Rendering.
+    // Let's assume list index 0 = Background (Bottom).
+    // So we push to end.
+    this.layers.push({
+      id: id,
+      name: name,
+      visible: true,
+      opacity: 1.0
     });
+    this.activeLayerId = id; // Auto-select new layer
+    this.notifyListeners();
+    this.tileManager?.getPersistence().saveLayers(this.layers);
+  }
 
-    window.addEventListener('keyup', (e) => {
-      if (e.code === 'Space') {
-        this.isSpacePressed = false;
-        this.isPanning = false;
-        this.canvas.style.cursor = 'default';
-      }
-    });
+  public deleteLayers(layerIds: string[]) {
+    // Prevent deleting all layers? Maybe keep at least one?
+    const kept = this.layers.filter(l => !layerIds.includes(l.id));
+    if (kept.length === 0) return; // Cannot delete all
 
-    this.canvas.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      const ZOOM_SPEED = 0.001;
-      const newZoom = this.viewport.zoom * (1 - e.deltaY * ZOOM_SPEED);
-      this.viewport.zoom = Math.max(0.1, Math.min(10, newZoom));
-    }, { passive: false });
+    this.layers = kept;
 
-    this.canvas.addEventListener('pointerdown', (e) => {
-      if (this.isSpacePressed) {
-        this.isPanning = true;
-        this.lastPointerX = e.clientX;
-        this.lastPointerY = e.clientY;
-        this.canvas.setPointerCapture(e.pointerId);
-        this.canvas.style.cursor = 'grabbing';
-      } else {
-        // Start Stroke
-        this.lastPointerX = e.clientX;
-        this.lastPointerY = e.clientY;
-        this.drawStroke(e.clientX, e.clientY, e.pressure || 0.5);
-        this.canvas.setPointerCapture(e.pointerId);
-      }
-    });
+    // If active layer was deleted, reset active to top-most
+    if (!this.layers.find(l => l.id === this.activeLayerId)) {
+      this.activeLayerId = this.layers[this.layers.length - 1].id;
+    }
 
-    this.canvas.addEventListener('pointermove', (e) => {
-      if (this.isPanning) {
-        const dx = e.clientX - this.lastPointerX;
-        const dy = e.clientY - this.lastPointerY;
+    this.notifyListeners();
+    this.tileManager?.getPersistence().saveLayers(this.layers);
+  }
 
-        this.viewport.x -= dx / this.viewport.zoom;
-        this.viewport.y -= dy / this.viewport.zoom;
+  public getLayers() {
+    return [...this.layers]; // Returns Bottom-to-Top order (render order)
+  }
 
-        this.lastPointerX = e.clientX;
-        this.lastPointerY = e.clientY;
-      } else if (e.buttons === 1 && !this.isSpacePressed) {
-        // Interpolate
-        this.interpolateStroke(this.lastPointerX, this.lastPointerY, e.clientX, e.clientY, e.pressure || 0.5);
-        this.lastPointerX = e.clientX; // Update last position
-        this.lastPointerY = e.clientY;
-      } else {
-        // Just moving logic (hover) if needed
-        this.lastPointerX = e.clientX;
-        this.lastPointerY = e.clientY;
-      }
-    });
+  public subscribe(callback: () => void) {
+    this.listeners.add(callback);
+    return () => { this.listeners.delete(callback); };
+  }
 
-    this.canvas.addEventListener('pointerup', (e) => {
-      if (this.isPanning) {
-        this.isPanning = false;
-        this.canvas.style.cursor = this.isSpacePressed ? 'grab' : 'default';
-      }
-      this.canvas.releasePointerCapture(e.pointerId);
-    });
+  private notifyListeners() {
+    this.listeners.forEach(cb => cb());
   }
 
   private onResize = () => {
@@ -607,7 +732,7 @@ export class CanvasManager {
 
     passEncoder.setBindGroup(0, this.bindGroupParams);
 
-    const visibleTiles = this.tileManager.getVisibleTiles();
+    const visibleTiles = this.tileManager.getVisibleTiles(this.layers);
 
     // Reusing the same buffer for all tiles would be a race condition if we used writeBuffer inside the pass?
     // Actually, writeBuffer happens on Queue. Render Pass recording is separate.
