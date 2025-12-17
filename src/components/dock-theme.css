@@ -1,0 +1,41 @@
+/* Qt-style Dark Theme for rc-dock */
+.dock-layout {
+    background: #1e1e1e;
+}
+
+.dock-panel {
+    background: #1e1e1e;
+    border: 1px solid #333;
+}
+
+.dock-bar {
+    background: #252526;
+    border-bottom: 1px solid #333;
+}
+
+.dock-tab {
+    background: #2d2d2d;
+    color: #969696;
+    border-right: 1px solid #1e1e1e;
+    padding: 4px 12px;
+    cursor: pointer;
+}
+
+.dock-tab-active {
+    background: #1e1e1e;
+    color: #ffffff;
+}
+
+.dock-tab:hover {
+    background: #2d2d2d;
+    color: #ffffff;
+}
+
+.dock-ink-bar {
+    background-color: #007acc;
+}
+
+.dock-divider {
+    background: #000;
+    width: 4px;
+}
