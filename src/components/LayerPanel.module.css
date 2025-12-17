@@ -1,20 +1,15 @@
 .panel {
-    position: absolute;
-    top: 80px;
-    /* Below Tool Panel or flexible */
-    right: 20px;
     background: #2b2b2b;
     color: #d4d4d4;
-    backdrop-filter: blur(10px);
-    border-radius: 8px;
-    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
-    width: 240px;
+    border-radius: 0;
+    width: 100%;
+    height: 100%;
     font-family: 'Segoe UI', sans-serif;
-    border: 1px solid #444;
+    border: none;
+    border-top: 1px solid #1e1e1e;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    max-height: 50vh;
 }
 
 .title {

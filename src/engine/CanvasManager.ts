@@ -13,6 +13,7 @@ export class CanvasManager {
     { id: 'layer-1', name: 'Drawing', visible: true, opacity: 1.0 },
     { id: 'layer-2', name: 'Overlay', visible: true, opacity: 1.0 },
   ];
+  public activeLayerId: string = 'layer-1'; // Default to Drawing layer
 
   public viewport: ViewportState = {
     x: 0,
@@ -35,9 +36,9 @@ export class CanvasManager {
 
 
   // Brush Pipeline
-  private activeTool: 'brush' | 'eraser' = 'brush';
-  private brushColor: { r: number, g: number, b: number, a: number } = { r: 0, g: 0, b: 0, a: 1 };
-  private brushSize: number = 50;
+  public activeTool: 'brush' | 'eraser' = 'brush';
+  public brushColor: { r: number, g: number, b: number, a: number } = { r: 0, g: 0, b: 0, a: 1 };
+  public brushSize: number = 50;
 
   private strokePoints: { x: number, y: number, pressure: number }[] = [];
   private overlayTexture: GPUTexture | null = null;
@@ -92,6 +93,12 @@ export class CanvasManager {
         this.activeLayerId = this.layers[0]?.id || 'layer-0';
       }
     }
+
+    // Initialize Sampler for texture sampling
+    this.sampler = this.device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+    });
 
     await this.initPipeline(format);
     await this.initBrushPipeline(format);
@@ -475,6 +482,14 @@ export class CanvasManager {
     };
   }
 
+  private getCanvasCoordinates(clientX: number, clientY: number): { x: number, y: number } {
+    const rect = this.canvas.getBoundingClientRect();
+    return {
+      x: clientX - rect.left,
+      y: clientY - rect.top
+    };
+  }
+
   private initInputHandlers() {
     window.addEventListener('keydown', (e) => {
       // Tool Shortcuts
@@ -505,21 +520,24 @@ export class CanvasManager {
       const zoomSensitivity = 0.001;
       const newZoom = this.viewport.zoom * (1 - e.deltaY * zoomSensitivity);
       this.viewport.zoom = Math.max(0.1, Math.min(newZoom, 10.0));
+      this.clearOverlay(); // Clear ghost on zoom
       this.notifyListeners();
       // Ideally zoom towards pointer, but keeping simple for now
     }, { passive: false });
 
     this.canvas.addEventListener('pointerdown', (e) => {
       this.canvas.setPointerCapture(e.pointerId);
+      const coords = this.getCanvasCoordinates(e.clientX, e.clientY);
 
       if (this.isSpacePressed || e.button === 1 || e.button === 2) {
         this.isPanning = true;
-        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+        this.lastPointerPos = coords;
+        this.clearOverlay(); // Clear ghost when starting to pan
         this.canvas.style.cursor = 'grabbing';
       } else if (e.buttons === 1) {
         // Start Drawing
         this.isPanning = false;
-        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+        this.lastPointerPos = coords;
         this.strokePoints = []; // Reset Stroke Buffer
         // Do we draw the first point?
         // pointermove will handle it.
@@ -527,18 +545,20 @@ export class CanvasManager {
     });
 
     this.canvas.addEventListener('pointermove', (e) => {
+      const coords = this.getCanvasCoordinates(e.clientX, e.clientY);
+
       if (this.isPanning) {
-        const dx = e.clientX - this.lastPointerPos.x;
-        const dy = e.clientY - this.lastPointerPos.y;
+        const dx = coords.x - this.lastPointerPos.x;
+        const dy = coords.y - this.lastPointerPos.y;
         this.viewport.x -= dx / this.viewport.zoom;
         this.viewport.y -= dy / this.viewport.zoom;
-        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+        this.lastPointerPos = coords;
         this.notifyListeners();
       } else if (e.buttons === 1 && this.activeTool) {
         // Drawing
         // Interpolate
-        this.interpolateStroke(this.lastPointerPos.x, this.lastPointerPos.y, e.clientX, e.clientY, e.pressure);
-        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+        this.interpolateStroke(this.lastPointerPos.x, this.lastPointerPos.y, coords.x, coords.y, e.pressure);
+        this.lastPointerPos = coords;
       }
     });
 
@@ -548,8 +568,8 @@ export class CanvasManager {
         this.isPanning = false;
         this.canvas.style.cursor = this.isSpacePressed ? 'grab' : 'default';
       } else {
-        // Commit the buffered stroke to tiles (LOD 0)
-        this.commitStroke().catch(console.error);
+        // Commit the buffered stroke to tiles (LOD 0) - fire and forget for responsiveness
+        this.commitStroke().catch(err => console.error('Stroke commit error:', err));
       }
     });
   }
@@ -656,8 +676,6 @@ export class CanvasManager {
     this.drawStroke(x2, y2, pressure);
   }
 
-  private activeLayerId: string = 'layer-1';
-
   // --- Public API for UI ---
 
   public setTool(tool: 'brush' | 'eraser') {
@@ -709,8 +727,29 @@ export class CanvasManager {
     return this.activeLayerId;
   }
 
+  private clearOverlay() {
+    if (!this.overlayTexture || !this.device) return;
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.overlayTexture.createView(),
+        loadOp: 'clear',
+        storeOp: 'store',
+        clearValue: { r: 0, g: 0, b: 0, a: 0 }
+      }]
+    });
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+  }
+
   private async commitStroke() {
-    if (this.strokePoints.length === 0) return;
+    console.log('[commitStroke] Starting, strokePoints:', this.strokePoints.length);
+    console.log('[commitStroke] activeLayerId:', this.activeLayerId);
+
+    if (this.strokePoints.length === 0) {
+      console.log('[commitStroke] No stroke points, returning');
+      return;
+    }
 
     // 1. Calculate AABB of stroke
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -727,11 +766,20 @@ export class CanvasManager {
     const margin = this.brushSize * 1.0; // max possible size roughly
     minX -= margin; minY -= margin; maxX += margin; maxY += margin;
 
-    // 2. Identify Tiles
-    const minTx = Math.floor(minX / TILE_SIZE);
-    const maxTx = Math.floor(maxX / TILE_SIZE);
-    const minTy = Math.floor(minY / TILE_SIZE);
-    const maxTy = Math.floor(maxY / TILE_SIZE);
+    // Calculate current LOD level (same logic as TileManager.update)
+    const currentLevel = Math.max(0, Math.floor(Math.log2(1 / this.viewport.zoom)));
+    const scale = Math.pow(2, currentLevel);
+    const tileSizeWorld = TILE_SIZE * scale;
+
+    console.log('[commitStroke] Current LOD level:', currentLevel, 'scale:', scale);
+
+    // 2. Identify Tiles at current LOD level
+    const minTx = Math.floor(minX / tileSizeWorld);
+    const maxTx = Math.floor(maxX / tileSizeWorld);
+    const minTy = Math.floor(minY / tileSizeWorld);
+    const maxTy = Math.floor(maxY / tileSizeWorld);
+
+    console.log('[commitStroke] Tile range:', { minTx, maxTx, minTy, maxTy });
 
     const activePipeline = this.activeTool === 'eraser' ? this.eraserPipeline : this.brushPipeline;
     const brushColor = this.brushColor;
@@ -739,15 +787,17 @@ export class CanvasManager {
     // 3. Process Tiles
     for (let tx = minTx; tx <= maxTx; tx++) {
       for (let ty = minTy; ty <= maxTy; ty++) {
-        // Ensure tile is loaded (Level 0)
-        const key = `${this.activeLayerId}:0:${tx}:${ty}`; // Level 0 key
+        // Ensure tile is loaded at current LOD level
+        const key = `${this.activeLayerId}:${currentLevel}:${tx}:${ty}`;
+
+        console.log('[commitStroke] Processing tile:', key);
 
         // Check memory
         let tile = this.tileManager.getTileByKey(key);
 
         if (!tile) {
-          // Force Load
-          await this.tileManager.forceLoadTile(this.activeLayerId, tx, ty, 0); // Need to expose this or use existing
+          // Force Load at current level
+          await this.tileManager.forceLoadTile(this.activeLayerId, tx, ty, currentLevel);
           tile = this.tileManager.getTileByKey(key);
         }
 
@@ -765,8 +815,8 @@ export class CanvasManager {
 
           // Draw all points
           for (const p of this.strokePoints) {
-            const localX = p.x - (tx * TILE_SIZE);
-            const localY = p.y - (ty * TILE_SIZE);
+            const localX = p.x - (tx * tileSizeWorld);
+            const localY = p.y - (ty * tileSizeWorld);
             const size = this.brushSize * p.pressure;
 
             // Frustum cull point against tile? Optimization.
@@ -817,19 +867,7 @@ export class CanvasManager {
     this.strokePoints = [];
 
     // Clear Overlay
-    if (this.overlayTexture) {
-      const encoder = this.device!.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: this.overlayTexture.createView(),
-          loadOp: 'clear',
-          storeOp: 'store',
-          clearValue: { r: 0, g: 0, b: 0, a: 0 }
-        }]
-      });
-      pass.end();
-      this.device!.queue.submit([encoder.finish()]);
-    }
+    this.clearOverlay();
   }
 
   public addLayer(name: string = "New Layer") {
@@ -889,13 +927,20 @@ export class CanvasManager {
     this.resize();
   };
 
-  private resize() {
+  public resize = () => {
     if (!this.canvas || !this.device) return;
 
     // Handle DPI scaling
     const dpr = window.devicePixelRatio || 1;
-    const width = window.innerWidth;
-    const height = window.innerHeight;
+
+    // Use Parent Element size if available (for Dock Layout), otherwise Window
+    const parent = this.canvas.parentElement;
+    const width = parent ? parent.clientWidth : window.innerWidth;
+    const height = parent ? parent.clientHeight : window.innerHeight;
+
+    console.log("CanvasManager.resize() called:", { width, height, dpr, hasParent: !!parent });
+
+    if (width === 0 || height === 0) return; // Avoid invalid texture creation
 
     this.canvas.width = width * dpr;
     this.canvas.height = height * dpr;
@@ -911,6 +956,9 @@ export class CanvasManager {
       format: navigator.gpu.getPreferredCanvasFormat(),
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
     });
+
+    // Force redraw
+    this.draw();
   }
 
   private startRenderLoop() {
@@ -1016,6 +1064,18 @@ export class CanvasManager {
 
     passEncoder.end();
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  public addListener(listener: () => void) {
+    this.listeners.add(listener);
+  }
+
+  public removeListener(listener: () => void) {
+    this.listeners.delete(listener);
+  }
+
+  public notifyListeners() {
+    this.listeners.forEach(listener => listener());
   }
 
   public destroy() {

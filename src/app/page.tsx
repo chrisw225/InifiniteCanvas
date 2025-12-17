@@ -2,9 +2,12 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CanvasManager } from "@/engine/CanvasManager";
-import ToolPanel from "@/components/ToolPanel";
+import { MenuBar } from "@/components/MenuBar";
+import { ToolSidebar } from "@/components/ToolSidebar";
+import { ColorPickerPanel } from "@/components/ColorPickerPanel";
+import { BrushSettingsPanel } from "@/components/BrushSettingsPanel";
 import LayerPanel from "@/components/LayerPanel";
-import { StatusPanel } from "@/components/StatusPanel";
+import { StatusBar } from "@/components/StatusBar";
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -32,7 +35,7 @@ export default function Home() {
         engine.destroy();
       }
     };
-  }, []); // Run once
+  }, []);
 
   if (error) {
     return (
@@ -45,18 +48,57 @@ export default function Home() {
   }
 
   return (
-    <main style={{ width: "100vw", height: "100vh", position: "relative", overflow: "hidden" }}>
-      <canvas
-        ref={canvasRef}
-        style={{ width: "100%", height: "100%", touchAction: "none" }}
-      />
-      {engine && (
-        <>
-          <ToolPanel engine={engine} />
-          <LayerPanel engine={engine} />
-          <StatusPanel engine={engine} />
-        </>
-      )}
+    <main style={{
+      width: "100vw",
+      height: "100vh",
+      display: "grid",
+      gridTemplateRows: "30px 1fr 25px",
+      gridTemplateColumns: "50px 1fr 280px",
+      overflow: "hidden",
+      background: "#1e1e1e"
+    }}>
+      {/* Menu Bar - spans all columns */}
+      <div style={{ gridRow: "1", gridColumn: "1 / -1" }}>
+        <MenuBar />
+      </div>
+
+      {/* Tool Sidebar */}
+      <div style={{ gridRow: "2", gridColumn: "1" }}>
+        {engine && <ToolSidebar engine={engine} />}
+      </div>
+
+      {/* Canvas Area */}
+      <div style={{ gridRow: "2", gridColumn: "2", position: "relative", background: "#3a3a3a" }}>
+        <canvas
+          ref={canvasRef}
+          style={{ width: "100%", height: "100%", touchAction: "none", display: "block" }}
+        />
+      </div>
+
+      {/* Right Panel - Color, Brush, Layers */}
+      <div style={{
+        gridRow: "2",
+        gridColumn: "3",
+        display: "flex",
+        flexDirection: "column",
+        overflow: "auto",
+        background: "#2b2b2b"
+      }}>
+        {engine && (
+          <>
+            <ColorPickerPanel engine={engine} />
+            <BrushSettingsPanel engine={engine} />
+            <div style={{ flex: 1, overflow: "auto" }}>
+              <LayerPanel engine={engine} />
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Status Bar - spans all columns */}
+      <div style={{ gridRow: "3", gridColumn: "1 / -1" }}>
+        {engine && <StatusBar engine={engine} />}
+      </div>
     </main>
   );
 }

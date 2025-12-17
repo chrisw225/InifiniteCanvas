@@ -208,8 +208,9 @@ export class TileManager {
         await this.persistenceManager.saveTile(key, blob);
 
         // 3. Invalidate Ancestors (LOD)
-        // Only if we just saved the base level (or a lower level triggering update)
-        // If we save Level 0, we must invalidate Level 1, 2, 3...
+        // TEMPORARILY DISABLED to prevent tile flashing
+        // TODO: Implement smarter invalidation that doesn't cause visual artifacts
+        /*
         if (level === 0) {
             let currentLevel = level;
             let currentTx = tx;
@@ -232,6 +233,7 @@ export class TileManager {
                 this.tiles.delete(parentKey);
             }
         }
+        */
     }
 
     // ... (Private helpers below) ...
