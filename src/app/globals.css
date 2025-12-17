@@ -13,7 +13,8 @@
 html,
 body {
   max-width: 100vw;
-  overflow: hidden; /* Prevent scrolling for infinite canvas */
+  overflow: hidden;
+  /* Prevent scrolling for infinite canvas */
 }
 
 body {
@@ -24,9 +25,11 @@ body {
   padding: 0;
   width: 100vw;
   height: 100vh;
+  touch-action: none;
+  /* Prevent default touch actions like scrolling/zooming */
 }
 
 canvas {
-    touch-action: none;
-    display: block;
+  touch-action: none;
+  display: block;
 }

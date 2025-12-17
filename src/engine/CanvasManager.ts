@@ -36,7 +36,9 @@ export class CanvasManager {
 
 
   // Brush Pipeline
+  private activeTool: 'brush' | 'eraser' = 'brush';
   private brushPipeline: GPURenderPipeline | null = null;
+  private eraserPipeline: GPURenderPipeline | null = null;
   private brushUniformBuffer: GPUBuffer | null = null; // Brush params (color, size, etc.)
   private brushBindGroup: GPUBindGroup | null = null;
 
@@ -298,6 +300,7 @@ export class CanvasManager {
 
     const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [layout] });
 
+    // BRUSH PIPELINE (Additive/Normal Blend)
     this.brushPipeline = this.device.createRenderPipeline({
       layout: pipelineLayout,
       vertex: { module: shaderModule, entryPoint: 'vert_main' },
@@ -305,10 +308,36 @@ export class CanvasManager {
         module: shaderModule,
         entryPoint: 'frag_main',
         targets: [{
-          format: format, // Using same format as canvas for simplicity
-          blend: { // Alpha Blending
+          format: format,
+          blend: {
             color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
             alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+          }
+        }]
+      },
+      primitive: { topology: 'triangle-list' }
+    });
+
+    // ERASER PIPELINE (Subtract/Clear)
+    // To erase: Dst = Dst * (1 - BrushAlpha).
+    // Standard blend: Src * SrcFactor + Dst * DstFactor
+    // If Src (output of shader) is (0,0,0,1) [Black full alpha] or just used for factor control?
+    // We want: R_out = R_in * (1 - Alpha_brush).
+    // So: SrcFactor = Zero, DstFactor = OneMinusSrcAlpha.
+    // Operation = Add.
+    // Shader must output Alpha = 1 where we want to erase.
+
+    this.eraserPipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: { module: shaderModule, entryPoint: 'vert_main' },
+      fragment: {
+        module: shaderModule,
+        entryPoint: 'frag_main',
+        targets: [{
+          format: format,
+          blend: {
+            color: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+            alpha: { srcFactor: 'zero', dstFactor: 'one-minus-src-alpha', operation: 'add' }
           }
         }]
       },
@@ -334,11 +363,13 @@ export class CanvasManager {
   }
 
   private drawStroke(screenX: number, screenY: number, pressure: number) {
-    if (!this.tileManager || !this.device || !this.brushPipeline || !this.brushBindGroup || !this.brushUniformBuffer) return;
+    if (!this.tileManager || !this.device || !this.brushPipeline || !this.eraserPipeline || !this.brushBindGroup || !this.brushUniformBuffer) return;
 
     const world = this.screenToWorld(screenX, screenY);
 
     const brushSize = 50 * pressure;
+    // For Eraser: Color doesn't matter for RGB if srcFactor is zero, but Alpha matters for DstFactor (OneMinusSrcAlpha).
+    // If we want full erase, Alpha = 1.0.
     const brushColor = { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 
     // Determine affected area in World Space
@@ -355,6 +386,8 @@ export class CanvasManager {
 
     const commandEncoder = this.device.createCommandEncoder();
     let hasWork = false;
+
+    const activePipeline = this.activeTool === 'eraser' ? this.eraserPipeline : this.brushPipeline;
 
     for (let tx = minTx; tx <= maxTx; tx++) {
       for (let ty = minTy; ty <= maxTy; ty++) {
@@ -393,7 +426,7 @@ export class CanvasManager {
 
         // We need a BindGroup for THIS buffer
         const bg = this.device.createBindGroup({
-          layout: this.brushPipeline.getBindGroupLayout(0),
+          layout: activePipeline.getBindGroupLayout(0),
           entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
         });
 
@@ -405,7 +438,7 @@ export class CanvasManager {
           }]
         });
 
-        renderPass.setPipeline(this.brushPipeline);
+        renderPass.setPipeline(activePipeline);
         renderPass.setBindGroup(0, bg);
         renderPass.draw(6);
         renderPass.end();
@@ -436,6 +469,16 @@ export class CanvasManager {
 
   private initInputHandlers() {
     window.addEventListener('keydown', (e) => {
+      // Tool Shortcuts
+      if (e.key.toLowerCase() === 'b') {
+        this.activeTool = 'brush';
+        console.log("Tool: Brush");
+      }
+      if (e.key.toLowerCase() === 'e') {
+        this.activeTool = 'eraser';
+        console.log("Tool: Eraser");
+      }
+
       if (e.code === 'Space' && !e.repeat) {
         this.isSpacePressed = true;
         this.canvas.style.cursor = 'grab';
